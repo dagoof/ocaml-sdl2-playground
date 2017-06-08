@@ -10,6 +10,9 @@ let scale = 3
 let unscale (mouse_x, mouse_y) =
     (mouse_x / scale, mouse_y / scale)
 
+let key_scancode e =
+    Sdl.Scancode.enum Sdl.Event.(get e keyboard_scancode) 
+
 let unify fn = function
     | Ok v -> v
     | Error e -> fn e
@@ -195,18 +198,20 @@ end
 
 type sprite_set = Sprite.t array
 
-let idle_sprite ss tick =
-    ss.(tick / 4 mod Array.length ss)
+let idle_sprite ?(speed=4) ss tick =
+    ss.(tick / speed mod Array.length ss)
 
-let random_sprite ss =
-    ss.(Random.int @@ Array.length ss)
+let random_array a =
+    a.(Random.int @@ Array.length a)
 
 type sprites =
     { character : sprite_set
+    ; eye_demon : sprite_set
+    ; red_patrol : sprite_set
     }
 
 type spray =
-    { sprite : Sprite.t
+    { sprite : sprite_set
     ; placement : position
     }
 
@@ -266,7 +271,9 @@ let render r (tick, state) =
     |> Renderer.clear
     |> Renderer.iter
         ( fun {sprite;placement} ->
-            Renderer.draw_sprite sprite placement )
+            Renderer.draw_sprite
+            ( idle_sprite ~speed:8 sprite tick ) placement 
+        )
         sprays
     |> Renderer.set_draw_color blue
     |> Renderer.draw_line
@@ -305,33 +312,148 @@ let init renderer =
          ; idle3
          ; idle4
         |]
+    and eye_demon_sprites () =
+        load_sprite "sprites/NPCs/eye-demon/idle1.png" >>= fun idle1 ->
+        load_sprite "sprites/NPCs/eye-demon/idle2.png" >>= fun idle2 ->
+        load_sprite "sprites/NPCs/eye-demon/idle3.png" >>= fun idle3 ->
+        load_sprite "sprites/NPCs/eye-demon/idle4.png" >>| fun idle4 ->
+        [| idle1
+         ; idle2
+         ; idle3
+         ; idle4
+        |]
+    and red_patrol_sprites () =
+        load_sprite "sprites/NPCs/red-patrol/vermelho1.png" >>= fun idle1 ->
+        load_sprite "sprites/NPCs/red-patrol/vermelho2.png" >>= fun idle2 ->
+        load_sprite "sprites/NPCs/red-patrol/vermelho3.png" >>| fun idle3 ->
+        [| idle1
+         ; idle2
+         ; idle3
+        |]
     in
     Sdl.render_set_scale renderer scale scale
     >>= character_sprites
-    >>| fun character ->
+    >>= fun character -> eye_demon_sprites ()
+    >>= fun eye_demon -> red_patrol_sprites ()
+    >>= fun red_patrol ->
+    Rresult.R.ok
     { mouse =
         { x = 15
         ; y = 15
         }
     ; sprites =
-        { character }
+        { character; eye_demon; red_patrol }
     ; sprays = []
     ; z = 0
     }
 
-let update state = function
+let update_mouse ?(dx=0) ?(dy=0) mouse =
+    let x = mouse.x + dx
+    and y = mouse.y + dy
+    in
+    { mouse with x; y }
+
+module E = Sdl.Event
+
+class common e = object
+    method enum      = E.(enum (get e typ))
+    method timestamp = E.(get e timestamp)
+end
+
+class keyboard e =
+    let state    = E.(get e keyboard_state) in
+    let scancode = E.(get e keyboard_scancode) in
+    let keycode  = E.(get e keyboard_keycode) in
+    let keymod   = E.(get e keyboard_keymod) in
+    object
+        inherit common e
+        method window_id = E.(get e joy_axis_axis)
+        method repeat    = E.(get e keyboard_repeat)
+        method state     = state
+        method scancode  = scancode
+        method scancode_enum = Sdl.Scancode.enum scancode
+        method keycode   = keycode
+        method keymod    = keymod
+end
+
+type mouse_state =
+    { button_mask : Sdl.uint32
+    ; position : position
+    }
+
+type 'a our_event =
+    | Mousemove of mouse_state
+    | Keyboard of keyboard
+    | Untouched of 'a
+
+let ourify_event = function
+    | `Mouse_motion, e ->
+        let button_mask, (x, y) = Sdl.get_mouse_state () in
+        let x, y = unscale (x, y) in
+        Mousemove { button_mask; position = {x; y}}
+    | `Key_down, e ->
+        Keyboard (new keyboard e)
+    | other -> Untouched other
+
+let update_raw state = function
     | `Mouse_motion, e ->
         let x, y = unscale @@ snd @@ Sdl.get_mouse_state ()
         in
         { state with mouse = { x; y }}
-    | `Mouse_button_down, e ->
-        let sprite    = random_sprite state.sprites.character
-        and placement = state.mouse
+    | `Key_down, e when key_scancode e = `Right ->
+        { state with mouse = update_mouse ~dx:10 state.mouse }
+    | `Key_down, e when key_scancode e = `Left ->
+        { state with mouse = update_mouse ~dx:(-10) state.mouse }
+    | `Key_down, e when key_scancode e = `Up ->
+        { state with mouse = update_mouse ~dy:(-10) state.mouse }
+    | `Key_down, e when key_scancode e = `Down ->
+        { state with mouse = update_mouse ~dy:10 state.mouse }
+    | `Key_down, e ->
+        let ke = new keyboard e in
+        Sdl.log "keycode  : [ %d ] `%s`" ke#keycode @@ Sdl.get_key_name ke#keycode;
+        Sdl.log "scancode : [ %d ] `%s`" ke#scancode @@ Sdl.get_scancode_name ke#scancode;
+        let {sprites} = state in
+        (* let sprite    = random_sprite state.sprites.character *)
+        let placement = state.mouse
+        and sprite    =
+            random_array
+            [| sprites.red_patrol
+             ; sprites.character
+             ; sprites.eye_demon
+            |]
         in
         { state with sprays = {sprite;placement} :: state.sprays }
     | otherwise -> state
 
-let run send ticks =
+let update state = function
+    | Mousemove {position} ->
+        { state with mouse = position }
+    | Keyboard kb when kb#scancode_enum = `Right ->
+        { state with mouse = update_mouse ~dx:10 state.mouse }
+    | Keyboard kb when kb#scancode_enum = `Left ->
+        { state with mouse = update_mouse ~dx:(-10) state.mouse }
+    | Keyboard kb when kb#scancode_enum = `Up ->
+        { state with mouse = update_mouse ~dy:(-10) state.mouse }
+    | Keyboard kb when kb#scancode_enum = `Down ->
+        { state with mouse = update_mouse ~dy:10 state.mouse }
+    | Keyboard ke ->
+        Sdl.log "keycode  : [ %d ] `%s`" ke#keycode @@ Sdl.get_key_name ke#keycode;
+        Sdl.log "scancode : [ %d ] `%s`" ke#scancode @@ Sdl.get_scancode_name ke#scancode;
+        let {sprites} = state in
+        (* let sprite    = random_sprite state.sprites.character *)
+        let placement = state.mouse
+        and sprite    =
+            random_array
+            [| sprites.red_patrol
+             ; sprites.character
+             ; sprites.eye_demon
+            |]
+        in
+        { state with sprays = {sprite;placement} :: state.sprays }
+    | otherwise -> state
+
+
+let run_queue send ticks =
     let finished = ref false
     and t = ref 0
     and event = Sdl.Event.create ()
@@ -343,9 +465,25 @@ let run send ticks =
         while Sdl.poll_event (Some event) do
             match Sdl.Event.(enum (get event typ)) with
             | `Quit -> finished := true
-            | e -> events := (e, event) :: !events
+            | e -> events := ourify_event (e, event) :: !events
         done;
         List.iter send @@ List.rev !events;
+        Sdl.delay 16l;
+        ticks !t
+    done
+
+let run send ticks =
+    let finished = ref false
+    and t = ref 0
+    and event = Sdl.Event.create ()
+    in
+    while not !finished do
+        t := 1 + !t;
+        while Sdl.poll_event (Some event) do
+            match Sdl.Event.(enum (get event typ)) with
+            | `Quit -> finished := true
+            | e -> send @@ ourify_event (e, event)
+        done;
         Sdl.delay 16l;
         ticks !t
     done
@@ -380,7 +518,7 @@ let main2 () =
         let s_fps    = React.S.sample tickstate ticks state in
         let view     = React.E.map (render renderer) s_fps
         in
-        run send s;
+        run_queue send s;
         React.E.stop e;
         React.S.stop state;
         React.E.stop view;
