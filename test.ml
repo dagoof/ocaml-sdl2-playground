@@ -85,21 +85,36 @@ let (>~>) t m = t >>| fun () -> Lazy.force m
 
 module Sprite : sig
     type t
+    type direction = [ `Horizontal | `Vertical | `None ]
 
     val create : Sdl.renderer -> string -> t Sdl.result
     val render : Sdl.renderer -> t -> position -> unit Sdl.result
+    val flip : direction -> t -> t
 end = struct
+    type direction =
+        [ `Horizontal | `Vertical | `None ]
+
     type t =
         { tex : Sdl.texture
         ; w : int
         ; h : int
+        ; flip : direction
         }
 
     let create renderer filename =
         let create_sprite tex =
-            Sdl.query_texture tex >>| fun (_, _, (w, h)) -> { tex; w; h }
+            Sdl.query_texture tex >>| fun (_, _, (w, h)) ->
+                { tex; w; h; flip = `None}
         in
         Image.load_texture renderer filename >>= create_sprite
+
+    let sdl_flip = function
+        | `Horizontal -> Sdl.Flip.horizontal
+        | `Vertical   -> Sdl.Flip.vertical
+        | `None       -> Sdl.Flip.none
+
+    let flip direction t =
+        { t with flip = direction }
 
     let render renderer t pos =
         let dst_rect =
@@ -109,18 +124,33 @@ end = struct
             t.w
             t.h
         in
-        Sdl.render_copy
-            ~dst:dst_rect 
+        match t.flip with
+        | `None ->
+            Sdl.render_copy
+                ~dst:dst_rect 
+                renderer
+                t.tex
+        | otherwise ->
+            Sdl.render_copy_ex
+            ~dst:dst_rect
             renderer
             t.tex
+            0.0
+            None
+            (sdl_flip otherwise)
 end
+
+let flip_randomly tick s =
+    if tick / 40 mod 2 = 0
+    then Sprite.flip `Horizontal s
+    else s
 
 module Renderer : sig
     type t
     type colour = { r : int; g : int; b : int; a : int }
     type point = { x : int; y : int }
 
-    val create : Sdl.renderer -> t
+    val create : ?noalloc:bool -> Sdl.renderer -> t
     val rgba : r:int -> g:int -> b:int -> a:int -> colour
     val rgb  : r:int -> g:int -> b:int -> colour
 
@@ -136,17 +166,26 @@ module Renderer : sig
     val iter : ('a -> t -> t) -> 'a list -> t -> t
     val present : t -> unit Sdl.result
 end = struct
+    type runtime =
+        | Deferred of unit Sdl.result Lazy.t list
+        | Immediate of unit Sdl.result
+
     type t =
         { renderer : Sdl.renderer
-        ; steps : unit Sdl.result Lazy.t list
+        ; runtime : runtime
         }
 
     type colour = { r : int; g : int; b : int; a : int }
 
     type point = { x : int; y : int }
 
-    let create renderer =
-        { renderer; steps = [] }
+    let create ?(noalloc=false) renderer =
+        let runtime =
+            if noalloc
+            then Immediate (Ok ())
+            else Deferred []
+        in
+        { renderer; runtime }
 
     let rgba ~r ~g ~b ~a =
         { r; g; b; a }
@@ -161,7 +200,9 @@ end = struct
         rgb ~r:0xFF ~g:0xFF ~b:0xFF
 
     let next_step t step =
-        { t with steps = step :: t.steps }
+        match t.runtime with
+        | Deferred  steps -> { t with runtime = Deferred (step :: steps) }
+        | Immediate sofar -> { t with runtime = Immediate (sofar >-> step) }
 
     let clear t =
         next_step t @@
@@ -187,13 +228,17 @@ end = struct
         List.fold_right (fun item t -> fn item t) items t
 
     let present t =
-        let drawn =
-            List.fold_right begin fun next sofar ->
-                sofar >-> next
-            end t.steps
-            ( Result.Ok () )
-        in
-        drawn >>| fun () -> Sdl.render_present t.renderer
+        match t.runtime with
+        | Deferred steps ->
+            let drawn =
+                List.fold_right begin fun next sofar ->
+                    sofar >-> next
+                end steps
+                ( Result.Ok () )
+            in
+            drawn >>| fun () -> Sdl.render_present t.renderer
+        | Immediate sofar ->
+            sofar >>| fun () -> Sdl.render_present t.renderer
 end
 
 type sprite_set = Sprite.t array
@@ -213,6 +258,7 @@ type sprites =
 type spray =
     { sprite : sprite_set
     ; placement : position
+    ; since : int
     }
 
 type state =
@@ -266,13 +312,15 @@ let render r (tick, state) =
             ~h:25
     in
 
-    Renderer.create r
+    Renderer.create ~noalloc:true r
     |> Renderer.set_draw_color black
     |> Renderer.clear
     |> Renderer.iter
-        ( fun {sprite;placement} ->
-            Renderer.draw_sprite
-            ( idle_sprite ~speed:8 sprite tick ) placement 
+        ( fun {sprite;placement;since} ->
+            let frame =
+                flip_randomly ( tick - since ) @@ idle_sprite ~speed:8 sprite tick
+            in
+            Renderer.draw_sprite frame placement
         )
         sprays
     |> Renderer.set_draw_color blue
@@ -371,9 +419,9 @@ class keyboard e =
         method repeat    = E.(get e keyboard_repeat)
         method state     = state
         method scancode  = scancode
-        method scancode_enum = Sdl.Scancode.enum scancode
         method keycode   = keycode
         method keymod    = keymod
+        method scancodee = Sdl.Scancode.enum scancode
 end
 
 type mouse_state =
@@ -387,13 +435,13 @@ type 'a our_event =
     | Untouched of 'a
 
 let ourify_event = function
-    | `Mouse_motion, e ->
+    | t, `Mouse_motion, e ->
         let button_mask, (x, y) = Sdl.get_mouse_state () in
         let x, y = unscale (x, y) in
-        Mousemove { button_mask; position = {x; y}}
-    | `Key_down, e ->
-        Keyboard (new keyboard e)
-    | other -> Untouched other
+        t, Mousemove { button_mask; position = {x; y}}
+    | t, `Key_down, e ->
+        t, Keyboard (new keyboard e)
+    | t, other, e -> t, Untouched (other, e)
 
 let update_raw state = function
     | `Mouse_motion, e ->
@@ -422,23 +470,21 @@ let update_raw state = function
              ; sprites.eye_demon
             |]
         in
-        { state with sprays = {sprite;placement} :: state.sprays }
+        { state with sprays = {sprite;placement;since=0} :: state.sprays }
     | otherwise -> state
 
 let update state = function
-    | Mousemove {position} ->
+    | t, Mousemove {position} ->
         { state with mouse = position }
-    | Keyboard kb when kb#scancode_enum = `Right ->
+    | t, Keyboard kb when kb#scancodee = `Right ->
         { state with mouse = update_mouse ~dx:10 state.mouse }
-    | Keyboard kb when kb#scancode_enum = `Left ->
+    | t, Keyboard kb when kb#scancodee = `Left ->
         { state with mouse = update_mouse ~dx:(-10) state.mouse }
-    | Keyboard kb when kb#scancode_enum = `Up ->
+    | t, Keyboard kb when kb#scancodee = `Up ->
         { state with mouse = update_mouse ~dy:(-10) state.mouse }
-    | Keyboard kb when kb#scancode_enum = `Down ->
+    | t, Keyboard kb when kb#scancodee = `Down ->
         { state with mouse = update_mouse ~dy:10 state.mouse }
-    | Keyboard ke ->
-        Sdl.log "keycode  : [ %d ] `%s`" ke#keycode @@ Sdl.get_key_name ke#keycode;
-        Sdl.log "scancode : [ %d ] `%s`" ke#scancode @@ Sdl.get_scancode_name ke#scancode;
+    | t, Keyboard kb when kb#scancodee = `Space ->
         let {sprites} = state in
         (* let sprite    = random_sprite state.sprites.character *)
         let placement = state.mouse
@@ -449,7 +495,11 @@ let update state = function
              ; sprites.eye_demon
             |]
         in
-        { state with sprays = {sprite;placement} :: state.sprays }
+        { state with sprays = {sprite;placement;since=t} :: state.sprays }
+    | t, Keyboard kb ->
+        Sdl.log "keycode  : [ %d ] `%s`" kb#keycode @@ Sdl.get_key_name kb#keycode;
+        Sdl.log "scancode : [ %d ] `%s`" kb#scancode @@ Sdl.get_scancode_name kb#scancode;
+        state
     | otherwise -> state
 
 
@@ -465,7 +515,7 @@ let run_queue send ticks =
         while Sdl.poll_event (Some event) do
             match Sdl.Event.(enum (get event typ)) with
             | `Quit -> finished := true
-            | e -> events := ourify_event (e, event) :: !events
+            | e -> events := ourify_event (!t, e, event) :: !events
         done;
         List.iter send @@ List.rev !events;
         Sdl.delay 16l;
@@ -482,7 +532,7 @@ let run send ticks =
         while Sdl.poll_event (Some event) do
             match Sdl.Event.(enum (get event typ)) with
             | `Quit -> finished := true
-            | e -> send @@ ourify_event (e, event)
+            | e -> send @@ ourify_event (!t, e, event)
         done;
         Sdl.delay 16l;
         ticks !t
