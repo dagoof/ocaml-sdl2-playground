@@ -74,11 +74,56 @@ module Errs = struct
     let running (`Msg e) = `Running e
 end
 
+module Point = struct
+    type 'a t =
+        { x : 'a
+        ; y : 'a
+        }
 
-type position =
-    { x : int
-    ; y : int
-    }
+    let map fn t =
+        { x = fn t.x
+        ; y = fn t.y
+        }
+
+    let fangle t1 t2 =
+        atan2 (t2.y -. t1.y) (t2.x -. t1.x)
+
+    let angle p1 p2 =
+        let t1 = map float_of_int p1
+        and t2 = map float_of_int p2
+        in
+        fangle t1 t2
+
+    let fdistance t1 t2 =
+        let dx = t2.x -. t1.x
+        and dy = t2.y -. t1.y
+        in
+        sqrt @@ (dx ** 2.0) +. (dy ** 2.0)
+
+    let distance p1 p2 =
+        let f1 = map float_of_int p1
+        and f2 = map float_of_int p2
+        in
+        fdistance f1 f2
+
+    let x t = t.x
+
+    let y t = t.y
+
+    let of_position pos = { x = pos.x; y = pos.y }
+
+    let create ~x ~y = { x; y }
+
+    let rect ~w ~h t =
+        Sdl.Rect.create ~x:t.x ~y:t.y ~w ~h
+end
+
+let center =
+    Point.create
+        ~x:(width / 2)
+        ~y:(height / 2)
+
+type position = int Point.t
 
 let (>->) t m = t >>= fun () -> Lazy.force m
 let (>~>) t m = t >>| fun () -> Lazy.force m
@@ -86,6 +131,9 @@ let (>~>) t m = t >>| fun () -> Lazy.force m
 module Sprite : sig
     type t
     type direction = [ `Horizontal | `Vertical | `None ]
+
+    val w : t -> int
+    val h : t -> int
 
     val create : Sdl.renderer -> string -> t Sdl.result
     val render : Sdl.renderer -> t -> position -> unit Sdl.result
@@ -100,6 +148,10 @@ end = struct
         ; h : int
         ; flip : direction
         }
+
+    let w t = t.w
+
+    let h t = t.h
 
     let create renderer filename =
         let create_sprite tex =
@@ -119,8 +171,8 @@ end = struct
     let render renderer t pos =
         let dst_rect =
             Sdl.Rect.create
-            pos.x
-            pos.y
+            pos.Point.x
+            pos.Point.y
             t.w
             t.h
         in
@@ -140,6 +192,173 @@ end = struct
             (sdl_flip otherwise)
 end
 
+type sprite_set = Sprite.t array
+
+let pi = 4.0 *. atan 1.0
+
+let pi2 = pi *. 2.0  
+
+module Vector : sig
+    type t =
+        { t : float
+        ; v : float
+        }
+
+    val create : v:float -> t:float -> t
+    val t : t -> float
+    val v : t -> float
+
+    val dx_dy : t -> float * float
+    val add : t -> t -> t
+    val point : t -> float Point.t
+
+    val scale : float -> t -> t
+    val adjust_point : float Point.t -> t -> float Point.t
+    val adjust_ipoint : int Point.t -> t -> int Point.t
+end = struct
+    type t =
+        { t : float
+        ; v : float
+        }
+
+    let create ~v ~t = {v; t}
+
+    let t _t = _t.t
+
+    let v _t = _t.v
+
+    let dx_dy {t;v} =
+        let x = ( cos t ) *. v
+        and y = ( sin t ) *. v
+        in
+        (x, y)
+
+    let point t =
+        let x, y = dx_dy t in
+        Point.create ~x ~y
+
+    (*
+    let add a b =
+        let pa = point a
+        and pb = point b
+        in
+        { v = Point.fdistance pa pb
+        ; t = Point.fangle pa pb
+        }
+    *)
+
+    let scale x t =
+        { t with v = t.v *. x }
+
+    let adjust_point p t =
+        let dx, dy = dx_dy t in
+        let x = Point.x p +. dx
+        and y = Point.y p +. dy
+        in
+        Point.create ~x ~y
+
+    let adjust_points vs =
+        List.fold_right begin fun v p ->
+            adjust_point p v
+        end
+        vs
+        (Point.create ~x:0.0 ~y:0.0)
+
+
+    let add a b =
+        let origin = Point.create ~x:0.0 ~y:0.0 in
+        let first  = adjust_point origin a in
+        let moved  = adjust_point first b
+        in
+        { v = Point.fdistance origin moved
+        ; t = Point.fangle    origin moved
+        }
+
+    let adjust_ipoint p t =
+        Point.map int_of_float @@
+        adjust_point ( Point.map float_of_int p ) t
+end
+
+module Entity : sig
+    type t
+
+    val create : Sprite.t -> t
+    val rect : t -> Sdl.rect
+    val position : t -> position
+    val vector : t -> Vector.t
+    val sprite : t -> Sprite.t
+    val nudge : ?angle:float -> ?velocity:float -> t -> t
+    val update : duration:float -> t -> t
+    val render : Sdl.renderer -> t -> unit Sdl.result
+end = struct
+
+    type t =
+        { x : float
+        ; y : float
+        ; speed : float
+        ; sprite : Sprite.t
+        ; a : float
+        ; v : float
+        ; t : float
+        }
+
+    let create sprite =
+        { sprite
+        ; x = 20.0
+        ; y = 20.0
+        ; speed = 1.0
+        ; a = 0.0
+        ; v = 0.0
+        ; t = 0.0
+        }
+
+    let sprite t =
+        t.sprite
+
+    let position t =
+        { Point.x = int_of_float t.x
+        ; y = int_of_float t.y
+        }
+
+    let rect t =
+        let w = Sprite.w t.sprite
+        and h = Sprite.h t.sprite
+        in
+        Point.rect ~w ~h (position t)
+
+    let vector t =
+        Vector.create ~v:t.v ~t:t.t
+
+    let nudge ?angle ?velocity t =
+        let current =
+            Vector.create ~t:t.t ~v:t.v
+        and next =
+            Vector.create
+                ~t:(Option.default t.t angle)
+                ~v:(Option.default 0.0 velocity)
+        in
+        let resultant =
+            Vector.add current next
+        in
+        { t with
+              v = Vector.v resultant
+            ; t = Vector.t resultant
+        }
+
+    let update ~duration t =
+        let dx = ( cos t.t ) *. t.v *. duration
+        and dy = ( sin t.t ) *. t.v *. duration
+        in
+        let x = t.x +. dx
+        and y = t.y +. dy
+        in
+        { t with x; y }
+
+    let render renderer t =
+        Sprite.render renderer (sprite t) (position t)
+end
+
+
 let flip_randomly tick s =
     if tick / 40 mod 2 = 0
     then Sprite.flip `Horizontal s
@@ -148,7 +367,6 @@ let flip_randomly tick s =
 module Renderer : sig
     type t
     type colour = { r : int; g : int; b : int; a : int }
-    type point = { x : int; y : int }
 
     val create : ?noalloc:bool -> Sdl.renderer -> t
     val rgba : r:int -> g:int -> b:int -> a:int -> colour
@@ -159,11 +377,13 @@ module Renderer : sig
 
     val clear : t -> t
     val set_draw_color : colour -> t -> t
-    val draw_line : point -> point -> t -> t
+    val draw_line : position -> position -> t -> t
     val draw_rect : Sdl.rect -> t -> t
     val draw_sprite : Sprite.t -> position -> t -> t
+    val draw_entity : Entity.t -> t -> t
 
     val iter : ('a -> t -> t) -> 'a list -> t -> t
+    val sometimes : bool -> ( t -> t ) -> t -> t
     val present : t -> unit Sdl.result
 end = struct
     type runtime =
@@ -176,8 +396,6 @@ end = struct
         }
 
     type colour = { r : int; g : int; b : int; a : int }
-
-    type point = { x : int; y : int }
 
     let create ?(noalloc=false) renderer =
         let runtime =
@@ -214,7 +432,7 @@ end = struct
 
     let draw_line a b t =
         next_step t @@
-        lazy ( Sdl.render_draw_line t.renderer a.x a.y b.x b.y )
+        lazy Point.( Sdl.render_draw_line t.renderer a.x a.y b.x b.y )
 
     let draw_rect rect t =
         next_step t @@
@@ -224,8 +442,17 @@ end = struct
         next_step t @@
         lazy ( Sprite.render t.renderer sprite pos )
 
+    let draw_entity entity t =
+        next_step t @@
+        lazy ( Entity.render t.renderer entity )
+
     let iter fn items t =
         List.fold_right (fun item t -> fn item t) items t
+
+    let sometimes predicate f t =
+        if predicate
+        then f t
+        else t
 
     let present t =
         match t.runtime with
@@ -240,8 +467,6 @@ end = struct
         | Immediate sofar ->
             sofar >>| fun () -> Sdl.render_present t.renderer
 end
-
-type sprite_set = Sprite.t array
 
 let idle_sprite ?(speed=4) ss tick =
     ss.(tick / speed mod Array.length ss)
@@ -263,9 +488,11 @@ type spray =
 
 type state =
     { mouse : position
+    ; player : Entity.t
     ; sprites : sprites
     ; sprays : spray list
     ; z : int
+    ; last_tick : int
     }
 
 let tickstate tick state = (tick, state)
@@ -295,7 +522,7 @@ let render r state =
 
 
 let render r (tick, state) =
-    let {mouse;sprites;sprays} = state
+    let {mouse;sprites;sprays;player} = state
     in
     let black = Renderer.black
     and white = Renderer.white
@@ -312,6 +539,18 @@ let render r (tick, state) =
             ~h:25
     in
 
+    let mouse_sprite =
+        idle_sprite sprites.character tick
+    in
+    let mouse_rect =
+        Point.rect
+            ~w:(Sprite.w mouse_sprite)
+            ~h:(Sprite.h mouse_sprite)
+            mouse
+    and player_rect =
+        Entity.rect player
+    in
+
     Renderer.create ~noalloc:true r
     |> Renderer.set_draw_color black
     |> Renderer.clear
@@ -325,23 +564,24 @@ let render r (tick, state) =
         sprays
     |> Renderer.set_draw_color blue
     |> Renderer.draw_line
-        { Renderer.x = 10; y = 15 }
-        { Renderer.x = 25; y = 35}
+        center
+        ( Vector.adjust_ipoint
+            center
+            ( Vector.scale 10.0 @@ Entity.vector player)
+        )
     |> Renderer.draw_sprite
         (idle_sprite sprites.character tick) mouse
-    |> Renderer.set_draw_color { red with g = 0xff }
-    |> Renderer.draw_line
-        { Renderer.x = 0; y = 0 }
-        { Renderer.x = mouse.x; y = mouse.y }
-    |> Renderer.draw_line
-        { Renderer.x = 0; y = height }
-        { Renderer.x = mouse.x; y = mouse.y }
-    |> Renderer.draw_line
-        { Renderer.x = width; y = 0 }
-        { Renderer.x = mouse.x; y = mouse.y }
-    |> Renderer.draw_line
-        { Renderer.x = width; y = height }
-        { Renderer.x = mouse.x; y = mouse.y }
+    |> Renderer.draw_entity player
+    |> Renderer.draw_rect ( Entity.rect player )
+    |> Renderer.sometimes
+        ( Sdl.has_intersection mouse_rect player_rect )
+        ( Renderer.set_draw_color red )
+    |> Renderer.draw_rect
+        ( Point.rect
+            ~w:(Sprite.w sprites.character.(0)) 
+            ~h:(Sprite.h sprites.character.(0)) 
+            mouse
+        )
     |> Renderer.present
     >>< log_msg ~prefix:"render err"
 
@@ -389,13 +629,17 @@ let init renderer =
         { x = 15
         ; y = 15
         }
+    ; player =
+        Entity.create character.(0)
     ; sprites =
         { character; eye_demon; red_patrol }
     ; sprays = []
     ; z = 0
+    ; last_tick = 0
     }
 
 let update_mouse ?(dx=0) ?(dy=0) mouse =
+    let open Point in
     let x = mouse.x + dx
     and y = mouse.y + dy
     in
@@ -403,9 +647,12 @@ let update_mouse ?(dx=0) ?(dy=0) mouse =
 
 module E = Sdl.Event
 
-class common e = object
-    method enum      = E.(enum (get e typ))
-    method timestamp = E.(get e timestamp)
+class common e =
+    let enum      = E.(enum (get e typ))
+    and timestamp = E.(get e timestamp) in
+    object
+        method enum      = enum
+        method timestamp = timestamp
 end
 
 class keyboard e =
@@ -430,110 +677,99 @@ type mouse_state =
     }
 
 type 'a our_event =
+    | Tick of int
     | Mousemove of mouse_state
     | Keyboard of keyboard
     | Untouched of 'a
 
 let ourify_event = function
-    | t, `Mouse_motion, e ->
+    | `Mouse_motion, e ->
         let button_mask, (x, y) = Sdl.get_mouse_state () in
         let x, y = unscale (x, y) in
-        t, Mousemove { button_mask; position = {x; y}}
-    | t, `Key_down, e ->
-        t, Keyboard (new keyboard e)
-    | t, other, e -> t, Untouched (other, e)
-
-let update_raw state = function
-    | `Mouse_motion, e ->
-        let x, y = unscale @@ snd @@ Sdl.get_mouse_state ()
-        in
-        { state with mouse = { x; y }}
-    | `Key_down, e when key_scancode e = `Right ->
-        { state with mouse = update_mouse ~dx:10 state.mouse }
-    | `Key_down, e when key_scancode e = `Left ->
-        { state with mouse = update_mouse ~dx:(-10) state.mouse }
-    | `Key_down, e when key_scancode e = `Up ->
-        { state with mouse = update_mouse ~dy:(-10) state.mouse }
-    | `Key_down, e when key_scancode e = `Down ->
-        { state with mouse = update_mouse ~dy:10 state.mouse }
+        Mousemove { button_mask; position = {x; y}}
     | `Key_down, e ->
-        let ke = new keyboard e in
-        Sdl.log "keycode  : [ %d ] `%s`" ke#keycode @@ Sdl.get_key_name ke#keycode;
-        Sdl.log "scancode : [ %d ] `%s`" ke#scancode @@ Sdl.get_scancode_name ke#scancode;
-        let {sprites} = state in
-        (* let sprite    = random_sprite state.sprites.character *)
-        let placement = state.mouse
-        and sprite    =
-            random_array
-            [| sprites.red_patrol
-             ; sprites.character
-             ; sprites.eye_demon
-            |]
-        in
-        { state with sprays = {sprite;placement;since=0} :: state.sprays }
-    | otherwise -> state
+        Keyboard (new keyboard e)
+    | other -> Untouched other
 
 let update state = function
-    | t, Mousemove {position} ->
+    | Mousemove {position} ->
         { state with mouse = position }
-    | t, Keyboard kb when kb#scancodee = `Right ->
-        { state with mouse = update_mouse ~dx:10 state.mouse }
-    | t, Keyboard kb when kb#scancodee = `Left ->
-        { state with mouse = update_mouse ~dx:(-10) state.mouse }
-    | t, Keyboard kb when kb#scancodee = `Up ->
-        { state with mouse = update_mouse ~dy:(-10) state.mouse }
-    | t, Keyboard kb when kb#scancodee = `Down ->
-        { state with mouse = update_mouse ~dy:10 state.mouse }
-    | t, Keyboard kb when kb#scancodee = `Space ->
-        let {sprites} = state in
+
+    | Keyboard kb when kb#scancodee = `Right ->
+        let velocity = 0.2 in
+        { state with
+            player = Entity.nudge ~angle:0.0 ~velocity state.player
+        }
+
+    | Keyboard kb when kb#scancodee = `Left ->
+        let velocity = 0.2 in
+        { state with
+            player = Entity.nudge ~angle:pi ~velocity state.player
+        }
+
+    | Keyboard kb when kb#scancodee = `Up ->
+        let velocity = 0.2 in
+        { state with
+            player = Entity.nudge ~angle:(pi /. -2.0) ~velocity state.player
+        }
+
+    | Keyboard kb when kb#scancodee = `Down ->
+        let velocity = 0.2 in
+        { state with
+            player = Entity.nudge ~angle:(pi /. 2.0) ~velocity state.player
+        }
+
+    | Keyboard kb when kb#scancodee = `Space ->
+        let {sprites;player;mouse} = state in
         (* let sprite    = random_sprite state.sprites.character *)
-        let placement = state.mouse
-        and sprite    =
+        let placement = mouse
+        and sprite =
             random_array
             [| sprites.red_patrol
              ; sprites.character
              ; sprites.eye_demon
             |]
+        and angle =
+            Point.angle
+                ( Entity.position player ) mouse
+        and velocity =
+            (fun x -> x /. 100.0) @@
+            Point.distance
+                ( Entity.position player ) mouse
         in
-        { state with sprays = {sprite;placement;since=t} :: state.sprays }
-    | t, Keyboard kb ->
+        { state with
+            sprays =
+                { sprite
+                ; placement
+                ; since = state.last_tick
+                } :: state.sprays
+          ; player = Entity.nudge ~angle ~velocity player
+        }
+    | Keyboard kb ->
         Sdl.log "keycode  : [ %d ] `%s`" kb#keycode @@ Sdl.get_key_name kb#keycode;
         Sdl.log "scancode : [ %d ] `%s`" kb#scancode @@ Sdl.get_scancode_name kb#scancode;
         state
+    | Tick last_tick ->
+        let player = Entity.update 1.0 state.player
+        in
+        { state with last_tick; player }
     | otherwise -> state
 
-
-let run_queue send ticks =
+let run send ticks =
     let finished = ref false
     and t = ref 0
     and event = Sdl.Event.create ()
     and events = ref []
     in
     while not !finished do
-        events := [];
-        t := 1 + !t;
+        t      := 1 + !t;
+        events := [ Tick !t ];
         while Sdl.poll_event (Some event) do
             match Sdl.Event.(enum (get event typ)) with
             | `Quit -> finished := true
-            | e -> events := ourify_event (!t, e, event) :: !events
+            | e -> events := ourify_event (e, event) :: !events
         done;
         List.iter send @@ List.rev !events;
-        Sdl.delay 16l;
-        ticks !t
-    done
-
-let run send ticks =
-    let finished = ref false
-    and t = ref 0
-    and event = Sdl.Event.create ()
-    in
-    while not !finished do
-        t := 1 + !t;
-        while Sdl.poll_event (Some event) do
-            match Sdl.Event.(enum (get event typ)) with
-            | `Quit -> finished := true
-            | e -> send @@ ourify_event (!t, e, event)
-        done;
         Sdl.delay 16l;
         ticks !t
     done
@@ -568,7 +804,7 @@ let main2 () =
         let s_fps    = React.S.sample tickstate ticks state in
         let view     = React.E.map (render renderer) s_fps
         in
-        run_queue send s;
+        run send s;
         React.E.stop e;
         React.S.stop state;
         React.E.stop view;
